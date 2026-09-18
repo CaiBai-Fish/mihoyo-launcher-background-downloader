@@ -1,0 +1,15 @@
+# Byte-exact checkout, deliberately.
+#
+# Several files in this project are sensitive to their exact bytes:
+#   - src/*.cpp, src/*.h and scripts/*.ps1 carry a UTF-8 BOM. Without it MSVC may
+#     read the Chinese string literals as GBK (the trailing byte of a CJK
+#     character swallows the next quote or '%', producing errors that point at
+#     unrelated lines), and Windows PowerShell 5.1 reads BOM-less scripts as GBK
+#     and fails to parse them outright.
+#   - scripts/verify.ps1 asserts on raw byte values (image magic numbers), so
+#     silent newline conversion would be a real hazard.
+#
+# Git for Windows ships core.autocrlf=true system-wide, which would rewrite these
+# to CRLF on a fresh clone. `-text` disables every line-ending conversion so the
+# working tree keeps whatever bytes are in the repository.
+* -text

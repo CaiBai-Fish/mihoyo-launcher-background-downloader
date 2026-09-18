@@ -1,0 +1,5 @@
+#pragma once
+
+// Rendered by CMake from src/version.h.in, or written directly by
+// scripts/build.ps1. The version in CMakeLists.txt is the single source of truth.
+#define DMBG_VERSION "@PROJECT_VERSION@"
