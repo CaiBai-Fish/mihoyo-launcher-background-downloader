@@ -62,6 +62,7 @@ const char* kHelpTemplate = R"(dmbg - 米哈游启动器背景资源下载器 (C
   -t, --threads <数量>      并发下载线程数（默认 5，范围 1-64）
       --all-exts            下载缓存里所有扩展名，不再只限 webp/webm
       --ext <列表>          自定义扩展名，逗号分隔，如 webp,webm,png
+      --force               已存在的文件也重新下载覆盖（默认跳过，避免堆出 _1 副本）
   -ot, --output-txt         把提取到的全部 URL 写入 all_urls.txt
   -h, --help                显示本帮助
   -v, --version             显示版本
@@ -387,6 +388,7 @@ struct Args {
     int threads = 5;
     bool output_txt = false;
     bool all_exts = false;
+    bool force = false;
     std::vector<std::string> extensions = kDefaultExtensions;
     bool help = false;
     bool version = false;
@@ -469,6 +471,8 @@ std::optional<Args> parse_arguments(int argc, char** argv, std::string& error) {
             args.output_txt = true;
         } else if (arg == "--all-exts") {
             args.all_exts = true;
+        } else if (arg == "--force") {
+            args.force = true;
         } else if (arg == "--ext") {
             const auto value = take_value(arg);
             if (!value) return std::nullopt;
@@ -672,6 +676,12 @@ ReadResult read_input_file(const fs::path& input) {
     return result;
 }
 
+// Result of reserving an output name for one URL.
+struct FileClaim {
+    std::string path;
+    bool already_complete = false; // an identical file is already there
+};
+
 // ==================== 进度条 ====================
 class ProgressBar {
 public:
@@ -745,7 +755,7 @@ private:
     void download_one(std::size_t index);
     void report_errors() const;
     void cleanup_staging() const;
-    std::string claim_output_path(const std::string& url, const std::string& content_type) const;
+    FileClaim claim_output_path(const std::string& url, const std::string& content_type) const;
     void open_output_directory() const;
 
     Args args_;
@@ -761,6 +771,7 @@ private:
     std::size_t success_ = 0;
     std::size_t failed_ = 0;
     std::size_t skipped_ = 0;
+    std::size_t already_present_ = 0;
     long long bytes_total_ = 0;
     mutable std::mutex report_mutex_;
     std::vector<std::string> errors_;
@@ -908,7 +919,7 @@ bool Application::write_url_list() const {
     return true;
 }
 
-std::string Application::claim_output_path(const std::string& url, const std::string& content_type) const {
+FileClaim Application::claim_output_path(const std::string& url, const std::string& content_type) const {
     const UrlParts parts = split_url(url);
 
     std::string name = base_name_of(parts.path);
@@ -933,19 +944,52 @@ std::string Application::claim_output_path(const std::string& url, const std::st
         const fs::path candidate =
             counter == 0 ? output_dir_ / fs::path(to_wide(name))
                          : output_dir_ / fs::path(to_wide(name + "_" + std::to_string(counter)));
+
+        if (args_.force) {
+            // Overwrite in place: --force means "replace what is there", so the
+            // first candidate is taken whether or not it already exists.
+            // Continuing past an existing file would emit "name_1.webp" instead,
+            // which is exactly the pile-up --force exists to avoid.
+            if (counter == 0) {
+                return FileClaim{path_to_utf8(candidate), false};
+            }
+        } else {
+            // The name is derived only from the URL, so an existing file that is
+            // not empty is this very resource and re-downloading it would just
+            // spawn "name_1.webp" copies on every run. A zero-byte file is a
+            // leftover placeholder from an interrupted run, so it is replaced.
+            //
+            // Keep looking when the name is taken by something unusable (a
+            // directory, or a file we cannot read): the loop then falls through
+            // to the next "_N" candidate, which is the old behaviour.
+            std::error_code error;
+            const bool exists = fs::exists(candidate, error);
+            if (!error && exists && !fs::is_directory(candidate, error) && !error) {
+                const std::uintmax_t size = fs::file_size(candidate, error);
+                if (!error) {
+                    if (size > 0) {
+                        return FileClaim{path_to_utf8(candidate), true};
+                    }
+                    std::error_code ignored;
+                    fs::remove(candidate, ignored); // discard the empty leftover
+                }
+            }
+        }
+
         // CREATE_NEW is atomic, so concurrent workers cannot pick the same name.
         HANDLE handle = CreateFileW(with_long_path_prefix(candidate).c_str(), GENERIC_WRITE, 0, nullptr,
                                     CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (handle != INVALID_HANDLE_VALUE) {
             CloseHandle(handle);
-            return path_to_utf8(candidate);
+            return FileClaim{path_to_utf8(candidate), false};
         }
         if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) {
-            return {};
+            return FileClaim{};
         }
     }
-    return {};
+    return FileClaim{};
 }
+
 void Application::download_one(std::size_t index) {
     const std::string& url = downloads_[index];
     if (args_.output_txt) {
@@ -953,7 +997,13 @@ void Application::download_one(std::size_t index) {
                  url);
     }
 
-    std::string output_path = claim_output_path(url, {});
+    const FileClaim claim = claim_output_path(url, {});
+    if (claim.already_complete) {
+        std::lock_guard<std::mutex> guard(report_mutex_);
+        ++already_present_;
+        return;
+    }
+    const std::string& output_path = claim.path;
     if (output_path.empty()) {
         std::lock_guard<std::mutex> guard(report_mutex_);
         ++failed_;
@@ -1116,9 +1166,17 @@ int Application::run() {
 
     report_errors();
 
-    char summary[256];
-    std::snprintf(summary, sizeof(summary), "下载完成: 成功 %zu 失败 %zu 跳过 %zu，共 %.1f MB，用时 %.1f 秒",
-                  success_, failed_, skipped_, static_cast<double>(bytes_total_) / (1024.0 * 1024.0), elapsed);
+    char summary[320];
+    if (already_present_ != 0) {
+        std::snprintf(summary, sizeof(summary),
+                      "下载完成: 新下载 %zu 已存在 %zu 失败 %zu 跳过 %zu，本次写入 %.1f MB，用时 %.1f 秒",
+                      success_, already_present_, failed_, skipped_,
+                      static_cast<double>(bytes_total_) / (1024.0 * 1024.0), elapsed);
+    } else {
+        std::snprintf(summary, sizeof(summary),
+                      "下载完成: 成功 %zu 失败 %zu 跳过 %zu，共 %.1f MB，用时 %.1f 秒", success_,
+                      failed_, skipped_, static_cast<double>(bytes_total_) / (1024.0 * 1024.0), elapsed);
+    }
     log_line(summary, failed_ == 0 ? kColorGreen : kColorYellow);
     log_line("文件保存路径: " + path_to_utf8(output_dir_));
 

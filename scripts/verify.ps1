@@ -84,6 +84,22 @@ function Get-Magic([string]$path) {
     }
 }
 
+# Real download names already look like "<hash>_<19-digit id>.webp", so a bare
+# "_\d+$" test matches normal files too. A genuine duplicate is a file ending in
+# "_<n>" whose base name (without that suffix) also exists in the folder.
+function Get-DuplicateNames([string]$dir) {
+    $files = @(Get-ChildItem -LiteralPath $dir -File)
+    $present = @{}
+    foreach ($file in $files) { $present[$file.Name] = $true }
+    $duplicates = @()
+    foreach ($file in $files) {
+        if ($file.BaseName -notmatch '_[1-9]\d*$') { continue }
+        $base = $file.BaseName -replace '_[1-9]\d*$', ''
+        if ($present.ContainsKey("$base$($file.Extension)")) { $duplicates += $file.Name }
+    }
+    return $duplicates
+}
+
 if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 New-Item -ItemType Directory -Path $work | Out-Null
 
@@ -179,6 +195,38 @@ $nested = Join-Path $work 'a\b\c'
 Invoke-Dmbg @('-i', $cacheFile, '-o', $nested, '-f', 'x', '--ext', 'webp')
 Assert-Equal 0 $RunExit '多级输出目录自动创建'
 Assert-Equal 1 @(Get-ChildItem -LiteralPath (Join-Path $nested 'x') -File).Count '仅下载 webp'
+
+Write-Host "== 6. 重复运行不产生副本 ==" -ForegroundColor Cyan
+# The Python version never overwrote, so every rerun added a "name_1.webp" copy.
+# Rerunning must now be a no-op that leaves the folder untouched.
+$idemDir = Join-Path $work 'idem'
+Invoke-Dmbg @('-i', $cacheFile, '-o', $idemDir, '-f', 'res', '-t', '4')
+Assert-Equal 0 $RunExit '首次下载成功'
+
+Invoke-Dmbg @('-i', $cacheFile, '-o', $idemDir, '-f', 'res', '-t', '4')
+Assert-Equal 0 $RunExit '重跑退出码 0'
+Assert-True ($RunOutput -match '新下载 0 已存在 2 失败 0') '重跑识别出 2 个已存在文件'
+Assert-Equal 0 @(Get-DuplicateNames (Join-Path $idemDir 'res')).Count '重跑没有产生 _1 副本'
+Assert-Equal 2 @(Get-ChildItem -LiteralPath (Join-Path $idemDir 'res') -File).Count '重跑后仍只有 2 个文件'
+
+# A zero-byte file is a placeholder left by an interrupted run: it must be
+# refilled rather than skipped, otherwise the resource is silently lost.
+$resDir = Join-Path $idemDir 'res'
+$victim = @(Get-ChildItem -LiteralPath $resDir -File | Where-Object { $_.Extension -eq '.webp' })[0]
+$victimLength = $victim.Length
+[System.IO.File]::WriteAllBytes($victim.FullName, (New-Object byte[] 0))
+Invoke-Dmbg @('-i', $cacheFile, '-o', $idemDir, '-f', 'res', '-t', '4')
+Assert-Equal 0 $RunExit '修复空文件后退出码 0'
+Assert-Equal $victimLength (Get-Item -LiteralPath $victim.FullName).Length '0 字节文件被重新下载填满'
+Assert-Equal 0 @(Get-ChildItem -LiteralPath $resDir -File | Where-Object { $_.Length -eq 0 }).Count '没有残留空文件'
+Assert-Equal 0 @(Get-DuplicateNames $resDir).Count '修复空文件没有产生副本'
+
+Write-Host "== 7. --force 覆盖而不新增 ==" -ForegroundColor Cyan
+Invoke-Dmbg @('-i', $cacheFile, '-o', $idemDir, '-f', 'res', '-t', '4', '--force')
+Assert-Equal 0 $RunExit '--force 退出码 0'
+Assert-True ($RunOutput -match '成功 2 失败 0') '--force 重新下载了 2 个文件'
+Assert-Equal 2 @(Get-ChildItem -LiteralPath $resDir -File).Count '--force 后仍是 2 个文件'
+Assert-Equal 0 @(Get-DuplicateNames $resDir).Count '--force 没有产生 _1 副本'
 
 Write-Host ""
 if ($failures.Count -eq 0) {
